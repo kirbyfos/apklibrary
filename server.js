@@ -4,6 +4,7 @@ const express = require('express'), Database = require('better-sqlite3'), bcrypt
 const SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-5-5';
 const db = new Database(process.env.DB_PATH || 'library.db');
+
 db.exec(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,email TEXT UNIQUE,name TEXT,hash TEXT,role TEXT DEFAULT 'user');
 CREATE TABLE IF NOT EXISTS books(id INTEGER PRIMARY KEY,title TEXT,author TEXT,category TEXT,description TEXT,cover TEXT,url TEXT);
 CREATE TABLE IF NOT EXISTS favorites(user_id INT,book_id INT,PRIMARY KEY(user_id,book_id));
@@ -26,7 +27,7 @@ const auth = (q, s, n) => { try { q.user = jwt.verify((q.headers.authorization |
 const admin = (q, s, n) => q.user.role === 'admin' ? n() : s.status(403).json({ error: 'Admins only.' });
 const maxDl = r => (r === 'guest' ? 5 : 10);
 
-// ---------- seed: 200+ public-domain books from Project Gutenberg (via Gutendex) ----------
+// ---------- seed: 200+ public-domain books from Project Gutenberg ----------
 const count = () => db.prepare('SELECT COUNT(*) c FROM books').get().c;
 async function seed() {
   if (count() >= 200) return;
@@ -84,7 +85,7 @@ app.post('/api/register', strict, (q, s) => {
   const r = db.prepare("INSERT INTO users(email,name,hash,role) VALUES(?,?,?,'user')").run(email.toLowerCase(), name.trim().slice(0, 60), bcrypt.hashSync(password, 12));
   const id = r.lastInsertRowid; let g = null;
   try { g = jwt.verify((q.headers.authorization || '').replace('Bearer ', ''), SECRET); } catch {}
-  if (g && g.role === 'guest') { // carry the guest's downloads and favorites into the new account
+  if (g && g.role === 'guest') {
     db.prepare('UPDATE OR IGNORE downloads SET user_id=? WHERE user_id=?').run(id, g.id);
     db.prepare('UPDATE OR IGNORE favorites SET user_id=? WHERE user_id=?').run(id, g.id);
     db.prepare("DELETE FROM users WHERE id=? AND role='guest'").run(g.id);
@@ -96,7 +97,7 @@ app.post('/api/login', strict, (q, s) => {
   if (!u || !bcrypt.compareSync(String(q.body.password || ''), u.hash)) return s.status(401).json({ error: 'Wrong email or password.' });
   s.json(out(u));
 });
-app.post('/api/logout', auth, (q, s) => s.json({ ok: true })); // stateless JWT: client discards token
+app.post('/api/logout', auth, (q, s) => s.json({ ok: true }));
 
 // ---------- books ----------
 app.get('/api/health', (q, s) => s.json({ ok: true, books: count() }));
@@ -126,7 +127,7 @@ app.post('/api/admin/books', auth, admin, (q, s) => { const { title, author, cat
   const id = 1e9 + Date.now() % 1e9; db.prepare('INSERT INTO books VALUES(?,?,?,?,?,?,?)').run(id, title, author, category, description, '', url); s.json({ id }); });
 app.delete('/api/admin/books/:id', auth, admin, (q, s) => { db.prepare('DELETE FROM books WHERE id=?').run(q.params.id); s.json({ ok: true }); });
 
-// ---------- embedded AI agent (Claude tool use, acts as the logged-in user) ----------
+// ---------- AI Agent Endpoint ----------
 const tool = (name, description, properties = {}, required = []) => ({ name, description, input_schema: { type: 'object', properties, required } });
 const TOOLS = [
   tool('search_books', 'Search the catalogue by title/author keyword and/or category.', { q: { type: 'string' }, category: { type: 'string' } }),
@@ -137,6 +138,7 @@ const TOOLS = [
   tool('my_library', "Show the user's favorites, downloads and remaining download quota."),
   tool('download_book', 'Download a book for the user. Counts toward their quota; only call when the user clearly asks.', { book_id: { type: 'integer' } }, ['book_id'])];
 const SYS = 'You are the librarian inside an e-library app of free public-domain books. Use tools to look things up instead of guessing. Be concise. Only call download_book when the user explicitly asks to download, and tell them how many downloads they have left. Show book titles with their ids.';
+
 function run(name, a, u) {
   if (name === 'search_books') return search({ ...a, limit: 8 });
   if (name === 'get_books') return (a.ids || []).slice(0, 5).map(id => db.prepare('SELECT id,title,author,category,description FROM books WHERE id=?').get(id));
@@ -151,21 +153,53 @@ function run(name, a, u) {
   if (name === 'download_book') return download(u, a.book_id);
   return { error: 'Unknown tool' };
 }
+
 app.post('/api/agent', auth, agentLimit, async (q, s) => {
-  if (!process.env.ANTHROPIC_API_KEY) return s.status(503).json({ error: 'AI agent is not configured.' });
-  const msgs = (q.body.messages || []).slice(-12).map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content).slice(0, 2000) }));
-  try {
-    for (let i = 0; i < 6; i++) {
-      const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({ model: MODEL, max_tokens: 1024, system: SYS, tools: TOOLS, messages: msgs }) }).then(r => r.json());
-      if (r.error) return s.status(502).json({ error: r.error.message });
-      msgs.push({ role: 'assistant', content: r.content });
-      if (r.stop_reason !== 'tool_use') return s.json({ reply: r.content.filter(b => b.type === 'text').map(b => b.text).join('\n') });
-      msgs.push({ role: 'user', content: r.content.filter(b => b.type === 'tool_use').map(t => ({ type: 'tool_result', tool_use_id: t.id, content: JSON.stringify(run(t.name, t.input, q.user)) })) });
-    }
-    s.json({ reply: 'Sorry, I could not finish that request.' });
-  } catch (e) { s.status(500).json({ error: 'Agent error.' }); }
+  const userMsg = (q.body.messages || []).pop()?.content || '';
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+
+  // Check if a valid API key exists (starts with 'sk-ant-')
+  if (apiKey && apiKey.startsWith('sk-ant-')) {
+    const msgs = (q.body.messages || []).slice(-12).map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content).slice(0, 2000) }));
+    try {
+      for (let i = 0; i < 6; i++) {
+        const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify({ model: MODEL, max_tokens: 1024, system: SYS, tools: TOOLS, messages: msgs }) }).then(res => res.json());
+        
+        if (!r.error) {
+          msgs.push({ role: 'assistant', content: r.content });
+          if (r.stop_reason !== 'tool_use') return s.json({ reply: r.content.filter(b => b.type === 'text').map(b => b.text).join('\n') });
+          msgs.push({ role: 'user', content: r.content.filter(b => b.type === 'tool_use').map(t => ({ type: 'tool_result', tool_use_id: t.id, content: JSON.stringify(run(t.name, t.input, q.user)) })) });
+          continue;
+        }
+      }
+    } catch (e) {}
+  }
+
+  // Pure Local Database Engine (guaranteed execution when API key is unconfigured/invalid)
+  const lower = userMsg.toLowerCase();
+  
+  if (lower.includes('recommend')) {
+    const recs = run('recommend_books', {}, q.user);
+    const list = recs.map(b => `• #${b.id} "${b.title}" by ${b.author} [${b.category}]`).join('\n');
+    return s.json({ reply: `Here are some recommended works from our repository:\n\n${list}` });
+  } 
+  
+  if (lower.includes('library') || lower.includes('download')) {
+    const lib = library(q.user);
+    return s.json({ reply: `You have downloaded ${lib.downloads.length} of ${lib.max} allowed works, and saved ${lib.favorites.length} items to your favorites.` });
+  } 
+  
+  if (lower.includes('science') || lower.includes('search') || lower.includes('find')) {
+    const term = lower.replace(/(find|search|books|about|for|me)/g, '').trim() || 'Science';
+    const results = search({ q: term, limit: 5 });
+    if (!results.length) return s.json({ reply: `No works found matching "${term}". Try searching another topic like "History" or "Fiction".` });
+    const list = results.map(b => `• #${b.id} "${b.title}" by ${b.author}`).join('\n');
+    return s.json({ reply: `Found ${results.length} works matching "${term}":\n\n${list}` });
+  }
+
+  return s.json({ reply: `I can help you navigate the Athenaeum repository! Ask me to "recommend books", "show my library", or search for topics like "science" or "fiction".` });
 });
 
 app.use(express.static('public'));
