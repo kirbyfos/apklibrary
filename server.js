@@ -127,7 +127,7 @@ app.post('/api/admin/books', auth, admin, (q, s) => { const { title, author, cat
   const id = 1e9 + Date.now() % 1e9; db.prepare('INSERT INTO books VALUES(?,?,?,?,?,?,?)').run(id, title, author, category, description, '', url); s.json({ id }); });
 app.delete('/api/admin/books/:id', auth, admin, (q, s) => { db.prepare('DELETE FROM books WHERE id=?').run(q.params.id); s.json({ ok: true }); });
 
-// ---------- AI Agent Endpoint ----------
+// ---------- AI Agent Endpoint (Hybrid: Claude + Local SQLite Fallback) ----------
 const tool = (name, description, properties = {}, required = []) => ({ name, description, input_schema: { type: 'object', properties, required } });
 const TOOLS = [
   tool('search_books', 'Search the catalogue by title/author keyword and/or category.', { q: { type: 'string' }, category: { type: 'string' } }),
@@ -158,7 +158,6 @@ app.post('/api/agent', auth, agentLimit, async (q, s) => {
   const userMsg = (q.body.messages || []).pop()?.content || '';
   const apiKey = process.env.ANTHROPIC_API_KEY;
 
-  // Check if a valid API key exists (starts with 'sk-ant-')
   if (apiKey && apiKey.startsWith('sk-ant-')) {
     const msgs = (q.body.messages || []).slice(-12).map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content).slice(0, 2000) }));
     try {
@@ -177,7 +176,7 @@ app.post('/api/agent', auth, agentLimit, async (q, s) => {
     } catch (e) {}
   }
 
-  // Pure Local Database Engine (guaranteed execution when API key is unconfigured/invalid)
+  // Local database fallback when API key is missing or invalid
   const lower = userMsg.toLowerCase();
   
   if (lower.includes('recommend')) {
